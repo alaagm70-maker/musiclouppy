@@ -1,0 +1,16 @@
+{
+  "name": "musiclouppy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "سيرفر الأغاني المتزامن لـ Loup Garou",
+  "main": "music-server.js",
+  "scripts": {
+    "start": "node music-server.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
