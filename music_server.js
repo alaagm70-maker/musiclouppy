@@ -8,24 +8,151 @@
  *  - أي لاعب يدخل جديد (أو عنده refresh) يطلب الحالة الحالية فيتزامن مباشرة مع البقية
  *    (السيرفر يحسب الوقت المنقضي من وقت البداية ويرسله، باش الكلاينت يقدر "يقفز" لنفس النقطة).
  *
+ * مكتبة الأغاني تُجلب من رابط خارجي (افتراضياً https://loupmusic.surge.sh) بدل فولدر محلي:
+ *  1) يجرب أولاً يقرا صفحة الرابط كاملة (HTML) ويلقط كل الروابط اللي تنتهي بامتداد صوت
+ *     (.mp3, .wav, .ogg, .m4a, .flac, .aac, .opus) — هاذي تخدم تلقائياً إذا عندك index.html
+ *     فصفحة surge يحتوي روابط لكل الأغاني (<a href="song1.mp3">...</a>).
+ *  2) إذا ما لقاش شي حاجة، يجرب يقرا ملف manifest باسم songs.json أو music.json فنفس الرابط
+ *     (مثال: https://loupmusic.surge.sh/songs.json) يحتوي مصفوفة JSON بأسماء/روابط الأغاني.
+ *  3) النتائج تتخزن فكاش لمدة قصيرة (CACHE_TTL_MS) باش ما تولّيش تطلب من surge فكل بحث.
+ *
+ *  ملاحظة: يحتاج Node.js 18+ (باش fetch تكون موجودة بصفة built-in). إذا عندك نسخة أقدم،
+ *  ثبت node-fetch وبدّل fetch(...) بـ require('node-fetch')(...).
+ *
  * الاستخدام في server.js متاعك:
  *
  *   const { attachMusicServer } = require('./music-server');
  *   const io = new Server(httpServer, { ... });
- *   attachMusicServer(io);
+ *   attachMusicServer(io, {
+ *     remoteMusicUrl: 'https://loupmusic.surge.sh', // رابط فيه الأغاني (اختياري، هاذا الافتراضي)
+ *   });
  *
  */
 
+const REMOTE_AUDIO_EXT_REGEX = /\.(mp3|wav|ogg|m4a|flac|aac|opus)(?:[?#]|$)/i;
+const HREF_REGEX = /href\s*=\s*["']([^"']+)["']/gi;
+
 function attachMusicServer(io, options = {}) {
+  console.log('🎵 [music-server] نظام الأغاني اتفعّل ومرتبط بـ Socket.io');
+
   // الحالة الحالية لكل غرفة: roomId -> { trackId, trackUrl, title, cover, addedByName, startedAt, isPlaying, queue }
   const roomStates = new Map();
 
   // باش تحدد شكون يقدر يبدّل الأغنية: 'anyone' | 'host-only'
   const permission = options.permission || 'anyone';
 
-  // مكتبة الأغاني المتاحة للبحث — زيد/بدّل هاذ المصفوفة بأغانيك
-  // كل عنصر: { id, title, url, cover }
-  const library = options.library || [];
+  // الرابط اللي فيه الأغاني
+  const remoteMusicUrl = (options.remoteMusicUrl || 'https://loupmusic.surge.sh').replace(/\/$/, '');
+
+  // كاش داخلي للمكتبة باش ما نطلبوش من surge فكل بحث
+  let libraryCache = [];
+  let libraryCacheAt = 0;
+  const CACHE_TTL_MS = options.cacheTtlMs || 20000; // يعاود يجلب كل 20 ثانية بالكثير
+
+  function fileNameFromUrl(u) {
+    try {
+      const clean = u.split('?')[0].split('#')[0];
+      return decodeURIComponent(clean.split('/').filter(Boolean).pop() || '');
+    } catch {
+      return u;
+    }
+  }
+
+  function titleFromFileName(fileName) {
+    return fileName.replace(/\.[^./]+$/, '');
+  }
+
+  function normalizeManifestEntry(entry) {
+    if (typeof entry === 'string') {
+      const url = new URL(entry, remoteMusicUrl + '/').toString();
+      const fileName = fileNameFromUrl(url);
+      return { id: url, title: titleFromFileName(fileName), url, cover: null };
+    }
+    if (entry && typeof entry === 'object') {
+      const rawUrl = entry.url || entry.file || entry.src || '';
+      if (!rawUrl) return null;
+      const url = new URL(rawUrl, remoteMusicUrl + '/').toString();
+      const fileName = fileNameFromUrl(url);
+      return {
+        id: entry.id || url,
+        title: entry.title || titleFromFileName(fileName),
+        url,
+        cover: entry.cover || null,
+      };
+    }
+    return null;
+  }
+
+  // يحاول يقرا manifest (songs.json أو music.json) فجذر الرابط
+  async function fetchManifestLibrary() {
+    for (const name of ['songs.json', 'music.json']) {
+      try {
+        const res = await fetch(remoteMusicUrl + '/' + name);
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          return data.map(normalizeManifestEntry).filter(Boolean);
+        }
+      } catch {
+        // تجاهل ونجرب التالي
+      }
+    }
+    return [];
+  }
+
+  // يحاول يقرا صفحة HTML فجذر الرابط ويلقط كل الروابط اللي تؤدي لملفات صوت
+  async function fetchHtmlLinkedLibrary() {
+    try {
+      const res = await fetch(remoteMusicUrl + '/');
+      if (!res.ok) return [];
+      const html = await res.text();
+      const found = new Map();
+      let m;
+      HREF_REGEX.lastIndex = 0;
+      while ((m = HREF_REGEX.exec(html))) {
+        const href = m[1];
+        if (!REMOTE_AUDIO_EXT_REGEX.test(href)) continue;
+        const url = new URL(href, remoteMusicUrl + '/').toString();
+        if (found.has(url)) continue;
+        const fileName = fileNameFromUrl(url);
+        found.set(url, { id: url, title: titleFromFileName(fileName), url, cover: null });
+      }
+      return [...found.values()];
+    } catch (err) {
+      console.warn(`[music-server] تعذر جلب المكتبة من ${remoteMusicUrl}:`, err.message);
+      return [];
+    }
+  }
+
+  async function scanMusicLibrary() {
+    const now = Date.now();
+    if (now - libraryCacheAt < CACHE_TTL_MS && libraryCache.length) {
+      return libraryCache;
+    }
+
+    const [manifestTracks, htmlTracks] = await Promise.all([
+      fetchManifestLibrary(),
+      fetchHtmlLinkedLibrary(),
+    ]);
+
+    const merged = new Map();
+    [...manifestTracks, ...htmlTracks].forEach((t) => {
+      if (t && t.url && !merged.has(t.url)) merged.set(t.url, t);
+    });
+
+    libraryCache = [...merged.values()];
+    libraryCacheAt = now;
+
+    if (!libraryCache.length) {
+      console.warn(`⚠️  [music-server] ما لقيتش أي أغاني فـ ${remoteMusicUrl} — تأكد كاين index.html فيه روابط للأغاني أو ملف songs.json`);
+    } else {
+      console.log(`🎶 [music-server] لقيت ${libraryCache.length} أغنية فـ ${remoteMusicUrl}`);
+    }
+    return libraryCache;
+  }
+
+  // يجلب المكتبة مرة أول عند تشغيل السيرفر باش تكون جاهزة قبل أول بحث
+  scanMusicLibrary();
 
   function getOrCreateRoom(roomId) {
     if (!roomStates.has(roomId)) {
@@ -111,13 +238,20 @@ function attachMusicServer(io, options = {}) {
       broadcastState(roomId);
     });
 
-    // البحث عن أغاني في مكتبة السيرفر
-    socket.on('music:search', ({ query } = {}) => {
+    // البحث عن أغاني: يجلب من loupmusic.surge.sh (أو الرابط اللي حددتو) ويرجع كل الأغاني
+    // (أو المطابقة للكلمة المكتوبة إذا كتب المستخدم شي حاجة)
+    socket.on('music:search', async ({ query } = {}) => {
+      const lib = await scanMusicLibrary();
       const q = (query || '').trim().toLowerCase();
       const results = !q
-        ? library.slice(0, 20)
-        : library.filter((t) => (t.title || '').toLowerCase().includes(q)).slice(0, 20);
+        ? lib // بلا بحث: يبعث كل الأغاني الموجودة فالرابط
+        : lib.filter((t) => t.title.toLowerCase().includes(q));
       socket.emit('music:searchResults', { results });
+    });
+
+    // يرجع المكتبة كاملة مباشرة (بلا بحث) — مفيد عند فتح لوحة البحث لأول مرة
+    socket.on('music:library', async () => {
+      socket.emit('music:searchResults', { results: await scanMusicLibrary() });
     });
 
     // إيقاف مؤقت
@@ -177,6 +311,46 @@ function attachMusicServer(io, options = {}) {
   });
 
   return { roomStates };
+}
+
+/**
+ * تشغيل مستقل: node music-server.js
+ * يصنع سيرفر HTTP + Socket.io خاص بيه وحدو، يربط منطق الأغاني، ويخبرك فالـ console
+ * بلي شغال باش تتأكد قبل ما تربطو مع لعبتك.
+ *
+ * متغيرات بيئة اختيارية:
+ *   MUSIC_SERVER_PORT أو PORT   -> المنفذ (افتراضياً 4001)
+ *   REMOTE_MUSIC_URL            -> رابط الأغاني (افتراضياً https://loupmusic.surge.sh)
+ */
+if (require.main === module) {
+  const http = require('http');
+  const { Server } = require('socket.io');
+
+  const PORT = process.env.MUSIC_SERVER_PORT || process.env.PORT || 4001;
+  const REMOTE_MUSIC_URL = process.env.REMOTE_MUSIC_URL || 'https://loupmusic.surge.sh';
+
+  const httpServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('🎵 music-server شغال ✅');
+  });
+
+  const io = new Server(httpServer, {
+    cors: { origin: '*' },
+  });
+
+  attachMusicServer(io, { remoteMusicUrl: REMOTE_MUSIC_URL });
+
+  httpServer.listen(PORT, () => {
+    console.log('────────────────────────────────────────');
+    console.log(`✅ music-server شغال على المنفذ ${PORT}`);
+    console.log(`🔗 رابط فحص سريع: http://localhost:${PORT}`);
+    console.log(`🎶 كيجيب الأغاني من: ${REMOTE_MUSIC_URL}`);
+    console.log('────────────────────────────────────────');
+  });
+
+  process.on('unhandledRejection', (err) => {
+    console.error('❌ [music-server] خطأ غير متوقع:', err);
+  });
 }
 
 module.exports = { attachMusicServer };
